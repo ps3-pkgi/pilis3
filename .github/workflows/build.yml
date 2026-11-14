@@ -1,0 +1,87 @@
+# 构建并发布 pilis3 的 PS3 安装包。
+#
+# 每次 push 到 main（或手动触发）：
+#   1. 用 docker/Dockerfile.ps3dev 打出带 PS3 SDK / tiny3D / ya2d / FFmpeg 的镜像，
+#      层缓存放 GitHub Actions Cache，SDK 的 488 MB 包与 FFmpeg 只在首次真正下载/编译；
+#   2. 在镜像里 make pkg，产出 out/pilis3.pkg 与 probe/out/vdec_probe.pkg；
+#   3. 上传 artifact，并以 pkg-<sha> 为 tag 创建 Release。
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ps3dev-pilis3:ci
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build toolchain image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ps3dev
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build packages
+        run: |
+          docker run --rm \
+            --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/ws" \
+            -w /ws \
+            -e PSL1GHT=/usr/local/ps3dev \
+            -e PS3DEV=/usr/local/ps3dev \
+            -e PORTLIBS=/usr/local/ps3dev/portlibs/ppu \
+            -e FFMPEG_PS3=/opt/ffmpeg-ps3 \
+            -e PATH=/usr/local/ps3dev/ppu/bin:/usr/local/ps3dev/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            ${{ env.IMAGE }} \
+            sh -c 'make -j"$(nproc)" pkg && make -C probe -j"$(nproc)" pkg'
+          # 容器内以 root 构建，产物属于 root；改回 runner 用户，便于后续读取和清理。
+          sudo chown -R "$(id -u):$(id -g)" out probe/out build probe/build
+
+      - name: Collect packages
+        run: |
+          mkdir -p dist
+          cp out/*.pkg dist/
+          cp probe/out/*.pkg dist/
+          test -s dist/pilis3.pkg
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ github.sha }}
+          path: dist/*.pkg
+          if-no-files-found: error
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pkg-${{ github.sha }}
+          name: pkg-${{ github.sha }}
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            dist/*.pkg
