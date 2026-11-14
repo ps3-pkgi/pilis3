@@ -1,0 +1,416 @@
+diff --git a/lib/source/commands.c b/lib/source/commands.c
+index 15e43a9..fc1559a 100644
+--- a/lib/source/commands.c
++++ b/lib/source/commands.c
+@@ -3,13 +3,16 @@
+ #include "buffer.h"
+ #include "rsxtiny.h"
+ 
+-
+ #define NV406ETCL_SET_REF							0x00000050
+ #define NV406ETCL_SEMAPHORE_ACQUIRE					0x00000068
+ #define NV40TCL_SEMAPHORE_OFFSET					0x00001d6c
+ #define NV40TCL_SEMAPHORE_BACKENDWRITE_RELEASE		0x00001d70
+ 
+ void rsxtiny_MakeCmdSpace(tiny_gcmContextData *context, u32 space) {
++	/* Let the SDK's own context callback handle a full buffer: it is the only
++	 * thing that knows how to wrap this FIFO. An earlier attempt replaced it
++	 * with a silent rewind, which left put behind get and parked the RSX. */
++	if (!context) return;
+ 	INTERNAL_COMMAND_LENGTH(context, space);
+ }
+ 
+diff --git a/lib/source/glue.c b/lib/source/glue.c
+index 2adb5b5..ed35011 100644
+--- a/lib/source/glue.c
++++ b/lib/source/glue.c
+@@ -1,5 +1,8 @@
++#include <stdint.h>
+ #include "rsxtiny.h"
+ 
++extern void ps3_boot_trace(const char *fmt, ...);
++
+ void rsxtiny_FlushBuffer(tiny_gcmContextData *context) {
+     u32 offset = 0;
+ 	gcmControlRegister volatile *control = gcmGetControlRegister(context);
+@@ -26,8 +29,10 @@ tiny_gcmContextData *rsxtiny_Init(const u32 cmdSize, const u32 ioSize, const voi
+ 		return context;
+ 	}
+     #else
+-    gcmContextData * contextPointer;
++    gcmContextData * contextPointer = NULL;
+ 	s32 ret = gcmInitBody(&contextPointer, cmdSize, ioSize, ioAddress);
++	ps3_boot_trace("t3d 02f gcmInitBody ret=%d ctx=%x",
++	               (int) ret, (unsigned)(uintptr_t) contextPointer);
+ 	if (ret == 0) {
+ 		// Double cast fixes warning about diffrent pointer sizes.
+ 		tiny_gcmContextData *context = (void *) contextPointer;
+diff --git a/lib/source/rsxutil.c b/lib/source/rsxutil.c
+index 955104c..73480fc 100644
+--- a/lib/source/rsxutil.c
++++ b/lib/source/rsxutil.c
+@@ -1,5 +1,7 @@
+ 
+ #include <stdio.h>
++#include <stdarg.h>
++#include <stdint.h>
+ #include <malloc.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -31,17 +33,131 @@ static u32 zformat;
+ u8 Video_aspect;
+ 
+ void *tiny_host_addr = NULL;
++
++int rsx_init_failed = 0;
++
++extern void ps3_boot_trace(const char *fmt, ...);
++
++void rsx_trace(const char *s) { ps3_boot_trace("%s", s); }
++
++void rsx_tracef(const char *fmt, ...) {
++    char line[192];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(line, sizeof line, fmt, ap);
++    va_end(ap);
++    ps3_boot_trace("%s", line);
++}
+ extern int Video_currentBuffer;
+ 
++/* Registered so cellGcmGetFlipStatus() actually tracks flips; the handler
++ * itself has nothing to do. Defined next to flip(). */
++static void tiny3d_flip_handler(const u32 head);
++
++/* Write a backend label and wait for the RSX to echo it back. This is the only
++ * dependable "is the RSX still executing commands" probe: put/get can look
++ * drained while the RSX has actually stopped. */
++static int tiny3d_label_sync(const char *tag)
++{
++    static u32 value;
++    volatile u32 *label;
++    int ms = 0;
++
++    value = (value == 0) ? 0x5a5a5a5a : (value + 1);
++    label = (volatile u32 *) gcmGetLabelAddress(255);
++    rsxtiny_SetWriteBackendLabel(context, 255, value);
++    rsxtiny_FlushBuffer(context);
++    while (ms < 200 && *label != value) { usleep(1000); ++ms; }
++    rsx_tracef("t3d %s label=%x want=%x after %d ms", tag, (unsigned) *label,
++               (unsigned) value, ms);
++    return (*label == value);
++}
++
+ 
+ // Initilize and rsx
+ void init_screen(int command_buffer, int z_method) {
++    rsx_tracef("t3d 01 init_screen enter cmd=%d z=%d", command_buffer, z_method);
+ 	// Allocate a 1Mb buffer, alligned to a 1Mb boundary to be our shared IO memory with the RSX.
+     
+ 	if(!tiny_host_addr) {
++        rsx_trace("t3d 01a host buffer memalign start");
+         tiny_host_addr = memalign(1024*1024, command_buffer);
++        rsx_tracef("t3d 01b host_addr=%x", (unsigned)(uintptr_t) tiny_host_addr);
+         // Initilise Reality, which sets up the command buffer and shared IO memory
+-	    context = rsxtiny_Init(0x10000, command_buffer, tiny_host_addr); 
++	    /* cmdSize must stay small: passing command_buffer (2 MB) makes
++         * gcmInitBody fail with 0x802100ff and leaves the io mapping invalid
++         * (gcmGetConfiguration then reports io=fff00000 ioSize=0). */
++        /* cmdSize was hard-coded to 64 KB, which cellGcmSys turns into a
++         * 28 KB FIFO inside the 2 MB io region (begin=io+0x1000,
++         * end=io+0x7ffc). At 1080p a single frame is well over 1 KB of
++         * commands, so the FIFO wrapped within the first flip and the RSX
++         * afterwards reported get=0x200000 (end of io) and stopped executing.
++         * Use the same size the official rsxtest sample uses. */
++        context = rsxtiny_Init(0x40000, command_buffer, tiny_host_addr); 
++        rsx_trace("t3d 02 gcmInitBody done");
++        {
++            uintptr_t c = (uintptr_t) context;
++            if ((c >> 32) == 0xFFFFFFFFu) {
++                c &= 0xFFFFFFFFu;
++                context = (tiny_gcmContextData *) c;
++                rsx_tracef("t3d 02e normalized ctx=%x", (unsigned) c);
++            }
++            rsx_tracef("t3d 02a ctx=%x host=%x", (unsigned) c,
++                       (unsigned)(uintptr_t) tiny_host_addr);
++            {
++                const u32 *hdr = (const u32 *) tiny_host_addr;
++                rsx_tracef("t3d 02h host[0..3]=%x %x %x %x",
++                           (unsigned) hdr[0], (unsigned) hdr[1],
++                           (unsigned) hdr[2], (unsigned) hdr[3]);
++            }
++
++            gcmConfiguration cfg;
++            memset(&cfg, 0, sizeof(cfg));
++            const int cfgRc = (int) gcmGetConfiguration(&cfg);
++            rsx_tracef("t3d 02d gcmGetConfiguration rc=%d local=%x localSize=%x io=%x ioSize=%x",
++                       cfgRc,
++                       (unsigned)(uintptr_t) cfg.localAddress, (unsigned) cfg.localSize,
++                       (unsigned)(uintptr_t) cfg.ioAddress, (unsigned) cfg.ioSize);
++
++            const int configured = (cfg.localSize != 0 && cfg.ioSize != 0);
++            if (!configured) {
++                rsx_trace("t3d 02c RSX not configured, abort init_screen");
++                rsx_init_failed = 1;
++                return;
++            }
++            if (c == 0 || c >= 0x80000000ull) {
++                /* gcmInitBody reported success but returned no usable context,
++                 * and the io buffer is not a tiny3D context either (its first
++                 * words are leftovers, which made every flip time out). Build a
++                 * context around a private command buffer inside the io region
++                 * cellGcmSys mapped for us, away from the first 64 KB it uses. */
++                static tiny_gcmContextData manual;
++                const u32 ioBase = (u32)(uintptr_t) cfg.ioAddress;
++                const u32 cmdbuf = ioBase + 0x10000u;
++                const u32 cmdsize = 0x40000u;
++                u32 off = 0;
++                const int a2o = (int) gcmAddressToOffset((void *)(uintptr_t) cmdbuf, &off);
++                manual.begin = cmdbuf;
++                manual.current = cmdbuf;
++                manual.end = cmdbuf + (cmdsize & ~3u) - 4;
++                manual.callback = 0;
++                context = &manual;
++                c = (uintptr_t) context;
++                rsx_tracef("t3d 02g manual cmd=%x end=%x a2o=%d off=%x",
++                           (unsigned) manual.begin, (unsigned) manual.end,
++                           a2o, (unsigned) off);
++            }
++            {
++                gcmControlRegister *cr0 = gcmGetControlRegister();
++                rsx_tracef("t3d 02k after init put=%x get=%x ref=%x",
++                           cr0 ? (unsigned) cr0->put : 0u,
++                           cr0 ? (unsigned) cr0->get : 0u,
++                           cr0 ? (unsigned) cr0->ref : 0u);
++            }
++            rsx_trace("t3d 02b RSX ready");
++        }
++    } else {
++        rsx_trace("t3d 02z reusing existing host buffer");
+     }
+ 
+ 	
+@@ -56,11 +172,20 @@ void init_screen(int command_buffer, int z_method) {
+ 
+ 
+ 	videoGetState(0, 0, &state); // Get the state of the display
++    rsx_tracef("t3d 03 videoGetState done res=%d aspect=%d",
++               (int) state.displayMode.resolution, (int) state.displayMode.aspect);
+    
+ 	// Get the current resolution
+ 	videoGetResolution(state.displayMode.resolution, &Video_Resolution);
+-
+-    rsxtiny_MakeCmdSpace(context, 0x4000);
++    rsx_tracef("t3d 04 videoGetResolution done w=%d h=%d",
++               (int) Video_Resolution.width, (int) Video_Resolution.height);
++
++    rsx_trace("t3d 05a MakeCmdSpace start");
++    /* 0x4000 would ask for 64 KB of room, but cellGcmSys builds only a
++     * ~28 KB FIFO here (begin=io+0x1000, end=io+0x7ffc), so the SDK callback
++     * could never satisfy the request and spun forever. Reserve what fits. */
++    rsxtiny_MakeCmdSpace(context, 0x1000);
++    rsx_trace("t3d 05 MakeCmdSpace done");
+ 	
+ 	Video_pitch = 4 * ((Video_Resolution.width + 15)/16) * 16; // each pixel is 4 bytes
+     
+@@ -86,9 +211,20 @@ void init_screen(int command_buffer, int z_method) {
+ 
+     Video_aspect=vconfig.aspect=state.displayMode.aspect;
+ 
+-	videoConfigure(0, &vconfig, NULL, 0);
+-    
+-	videoGetState(0, 0, &state); 
++	/* Configure unconditionally. Skipping it when the reported mode already
++	 * matched saved ~300 ms of blanking at boot, but it also means the display
++	 * pipe is not (re)programmed by this process. Everything that depends on
++	 * flip completion is broken on this console -- the control register's ref
++	 * stays 0xffffffff, gcmGetFlipStatus() never returns to 0, and cellGcmSys
++	 * therefore never reclaims a command-buffer segment (see "MakeCmdSpace ->
++	 * callback"). Owning the pipe is the cheapest thing to rule out. */
++	rsx_tracef("t3d 05b videoConfigure (always, mode %d aspect %d)",
++	           (int) state.displayMode.resolution,
++	           (int) state.displayMode.aspect);
++	const s32 cfgRet = videoConfigure(0, &vconfig, NULL, 0);
++	rsx_tracef("t3d 06 videoConfigure ret=%d", (int) cfgRet);
++	videoGetState(0, 0, &state);
++	tiny3d_label_sync("06c after configure");
+ 
+     // trick to reinit the memory
+     rsxtiny_MemAlign(-1, 0);
+@@ -103,13 +239,21 @@ void init_screen(int command_buffer, int z_method) {
+     // 32 bit float. Note it uses 1920 as minimun because i thinking to use buffer Z with setupRenderTarget2() with one surface > screen
+         depth_buffer_size = depth_pitch * ((Video_Resolution.height > 1088) ? (((Video_Resolution.height+15)/16)*16) : 1088);
+ 	}
++	gcmSetFlipHandler(tiny3d_flip_handler);
+ 	gcmSetFlipMode(GCM_FLIP_VSYNC); // Wait for VSYNC to flip
++    rsx_trace("t3d 07 flip mode set");
+ 
+ 	// Allocate two buffers for the RSX to draw to the screen (double buffering)
++	rsx_tracef("t3d 07a alloc buffers size=%d depth=%d pitch=%d",
++	           (int) buffer_size, (int) depth_buffer_size, Video_pitch);
+ 	Video_buffer[0] = rsxtiny_MemAlign(64, buffer_size);
+ 	Video_buffer[1] = rsxtiny_MemAlign(64, buffer_size);
+ 	
+ 	depth_buffer = rsxtiny_MemAlign(64, depth_buffer_size);
++	rsx_tracef("t3d 07b buffers=%x %x depth=%x",
++	           (unsigned)(uintptr_t) Video_buffer[0],
++	           (unsigned)(uintptr_t) Video_buffer[1],
++	           (unsigned)(uintptr_t) depth_buffer);
+ 
+ 	rsxtiny_AddressToOffset(Video_buffer[0], &offset[0]);
+ 	rsxtiny_AddressToOffset(Video_buffer[1], &offset[1]);
+@@ -117,15 +261,35 @@ void init_screen(int command_buffer, int z_method) {
+ 	// Setup the display buffers
+ 	gcmSetDisplayBuffer(0, offset[0], Video_pitch, Video_Resolution.width, Video_Resolution.height);
+ 	gcmSetDisplayBuffer(1, offset[1], Video_pitch, Video_Resolution.width, Video_Resolution.height);
++    rsx_tracef("t3d 08 display buffers set off0=%x off1=%x",
++               (unsigned) offset[0], (unsigned) offset[1]);
+ 
+ 	rsxtiny_AddressToOffset(depth_buffer, &depth_offset);
+ 
++	tiny3d_label_sync("08a after display buffers");
+ 	gcmResetFlipStatus();
++	rsx_trace("t3d 08b flip status reset");
+ 	flip(Video_currentBuffer ^ 1);
++	tiny3d_label_sync("09 first flip done");
++	/* Give the first flip a bounded chance to complete. Without waitFlip() in
++	 * the frame loop this is the only place that can tell "flip pending right
++	 * after submit" apart from "flip never completes". */
++	{
++		int ms = 0;
++		while (ms < 50 && gcmGetFlipStatus() != 0) { usleep(1000); ++ms; }
++		rsx_tracef("t3d 09a flipstatus=%d after %d ms",
++		           (int) gcmGetFlipStatus(), ms);
++	}
++    rsx_tracef("t3d 09b begin=%x end=%x cur=%x cb=%x",
++               (unsigned) context->begin, (unsigned) context->end,
++               (unsigned) context->current, (unsigned) context->callback);
+ 
+ }
+ 
+ void waitFlip() { // Block the PPU thread untill the previous flip operation has finished.
++/* Back to the upstream 2 s budget (10000 x 200us). With gcmSetWaitFlip()
++ * restored in flip(), the RSX itself waits at the flip point and this is only
++ * the safety net -- shortening it to 33 ms made a slow flip look "done". */
+ int n = 10000;
+ 	while(n>0){
+         volatile int ret= gcmGetFlipStatus();
+@@ -140,9 +304,20 @@ int n = 10000;
+     if(n<=0) {tiny3d_alarm(5);return;} // fatal error
+ }
+ 
++/* cellGcmGetFlipStatus() only tracks flips once a flip handler has been
++ * registered; without one it stays at 1, which made waitFlip() spin for its
++ * whole timeout on every frame. The handler itself does nothing. */
++static void tiny3d_flip_handler(const u32 head) { (void) head; }
++
+ void flip(s32 buffer) {
+ 	gcmSetFlip((gcmContextData *) context, buffer);
+ 	rsxtiny_FlushBuffer(context);
++	/* Restored: parks the RSX at the flip point until the flip completes, so
++	 * the next frame's commands cannot overwrite the buffer being scanned
++	 * out. The earlier removal was a workaround for the FIFO that could never
++	 * satisfy a 64 KB MakeCmdSpace() request (get pinned at 0x200000); that
++	 * root cause is fixed (cmdSize 0x40000, reservations 0x1000), and flips
++	 * complete in ~10 ms, so the wait should no longer park forever. */
+ 	gcmSetWaitFlip((gcmContextData *) context); // Prevent the RSX from continuing until the flip has finished.
+ }
+ 
+diff --git a/lib/source/tiny3d.c b/lib/source/tiny3d.c
+index 4b94641..404bdcb 100644
+--- a/lib/source/tiny3d.c
++++ b/lib/source/tiny3d.c
+@@ -207,6 +207,9 @@ static MATRIX model_view;
+ #define CASE_POLYGON1(x, min, mod) case x: \
+        min_vertex = min; mod_vertex = mod; break;
+ 
++extern void rsx_trace(const char *s);
++extern void rsx_tracef(const char *fmt, ...);
++extern int rsx_init_failed;
+ static gcmControlRegister *CtrlReg = NULL;
+ 
+ 
+@@ -267,12 +270,15 @@ void tiny3d_Exit(void)
+ 
+     if(!inited) return;
+ 
+-    gcmSetWaitFlip((gcmContextData *) context);
++    /* gcmSetWaitFlip() parks the RSX until a flip completes, and the reference
++     * round-trip below never finishes on this firmware (ref stays 0xffffffff),
++     * which made the process hang on exit after the HOME menu. Flush and give
++     * the RSX a bounded moment instead of waiting forever. */
+     rsxtiny_SetReferenceCommand(context, 1);
+ 	rsxtiny_FlushBuffer(context);
+ 
+ 	gcmControlRegister volatile *ctrl = gcmGetControlRegister((gcmContextData *) context);
+-	while(ctrl->ref != 1) usleep(30);
++	for (int n = 0; n < 200 && ctrl && ctrl->ref != 1; ++n) usleep(1000);
+ 
+ 
+     //free(tiny_host_addr);
+@@ -342,12 +348,21 @@ int tiny3d_Init(u32 vertex_buff_size)
+     size_rsx_vertex = vertex_buff_size;
+ 
+     init_screen(vertex_buff_size * 2, use_Z32);
++    rsx_trace("t3d 10 init_screen returned");
++    if (rsx_init_failed) { rsx_trace("t3d 10b init_screen failed -> CANNOTINIT"); return TINY3D_CANNOTINIT; }
+ 
+     CtrlReg = gcmGetControlRegister((gcmContextData *) context);
++    rsx_tracef("t3d 10c control register=%x", (unsigned)(uintptr_t) CtrlReg);
++    if (CtrlReg) {
++        volatile u32 *cr = (volatile u32 *)(uintptr_t) CtrlReg;
++        rsx_tracef("t3d 10d put=%x get=%x ref=%x", (unsigned) cr[0], (unsigned) cr[1], (unsigned) cr[2]);
++    }
+ 
+     n = 0;
+ 
++    rsx_trace("t3d 11 installing shaders");
+     while(fpshader_list[n]) {
++        rsx_tracef("t3d 11.%d shader", n);
+ 
+         // install fragments shaders in rsx memory
+         u32 *frag_mem = rsxtiny_MemAlign(256, (((realityFragmentProgram_internal *) fpshader_list[n])->size * 4 + 255) & ~255);
+@@ -386,6 +401,8 @@ int tiny3d_Init(u32 vertex_buff_size)
+         data_shader[n].fixed_color = 0;
+     }
+ 
++    rsx_tracef("t3d 11b %d shaders installed", n);
++
+     data_shader[0].off_texture  = -1; // colorf
+     data_shader[0].off_texture2 = -1;
+     data_shader[0].off_normal   = -1;
+@@ -471,7 +488,9 @@ int tiny3d_Init(u32 vertex_buff_size)
+     sysUtilUnregisterCallback(EVENT_SLOT3);
+     sysUtilRegisterCallback(EVENT_SLOT3, tiny3d_callback, NULL);
+ 
++    rsx_trace("t3d 12 shaders done, registering callback");
+     atexit(tiny3d_Exit);
++    rsx_trace("t3d 13 tiny3d_Init OK");
+ 
+     return TINY3D_OK;
+ }
+@@ -1109,7 +1128,7 @@ void tiny3d_Flip()
+     Video_currentBuffer = !Video_currentBuffer;
+ 
+     if(tinyerror_incallback) tiny_3d_alarm = 1;
+-    rsxtiny_MakeCmdSpace(context, 0x4000);
++    rsxtiny_MakeCmdSpace(context, 0x1000);
+     setupRenderTarget(Video_currentBuffer);
+ 
+     sysUtilCheckCallback();
+@@ -1670,7 +1689,7 @@ void tiny3d_Disable_YUV() {
+ 
+ void tiny3d_Dirty_Status() {
+ 
+-    rsxtiny_MakeCmdSpace(context, 0x4000);
++    rsxtiny_MakeCmdSpace(context, 0x1000);
+     tiny3d_Disable_YUV();
+ 
+     n_vertex = 0;
+@@ -1688,5 +1707,5 @@ void * tiny3d_Get_GCM_Context(void) {
+ }
+ 
+ void tiny3d_DoCmd_Space(int space) {
+-    rsxtiny_MakeCmdSpace(context, (space <= 0) ? 0x4000: space);
++    rsxtiny_MakeCmdSpace(context, (space <= 0) ? 0x1000: space);
+ }

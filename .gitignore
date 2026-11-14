@@ -1,0 +1,23 @@
+# build outputs
+/build/
+/out/
+/probe/build/
+/probe/out/
+*.elf
+*.self
+*.pkg
+*.map
+*.o
+*.d
+
+# reference checkouts, not part of pilis3
+/pkgi/
+/wilimini/
+/wilips3/
+
+# editor / agent state
+!.codebuddy/
+.vscode/
+# 构建产物只提交 EBOOT（build/pkg/USRDIR/EBOOT.BIN），.pkg 不进仓库
+!build/pkg/
+!probe/build/pkg/

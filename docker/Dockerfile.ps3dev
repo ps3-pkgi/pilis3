@@ -1,0 +1,47 @@
+# Alternative toolchain image: builds the port on the public ps3dev PSL1GHT
+# image instead of the (older) ps3dev-pkgi image, for hosts that do not have it.
+#
+#   docker build --platform linux/amd64 -t ps3dev-wilimini -f docker/Dockerfile.ps3dev .
+#
+# The SDK is replaced with the exact toolchain pkgi ships with
+# (bucanero/ps3toolchain 2020-08-31). pkgi drives RSX correctly on real
+# hardware with that build; the ps3dev/ps3dev image's 2020-07-03 SDK does not.
+# pkgi's CI additionally pins the official sysutil.h on top of it, same here.
+FROM --platform=linux/amd64 ps3dev/ps3dev:submodules
+
+ENV PSL1GHT=/usr/local/ps3dev \
+    PS3DEV=/usr/local/ps3dev \
+    PORTLIBS=/usr/local/ps3dev/portlibs/ppu \
+    FFMPEG_PS3=/opt/ffmpeg-ps3
+
+# Keep this before any COPY: it pulls a 488 MB tarball and nothing below should
+# be able to invalidate it. Editing patches/ must only rebuild the last layer.
+RUN wget -qO /tmp/t.tar.gz "https://github.com/bucanero/ps3toolchain/releases/download/ubuntu-latest-fad3b5fb/ps3dev-ubuntu-latest-2020-08-31.tar.gz" \
+    && mkdir -p /tmp/x && tar xzf /tmp/t.tar.gz -C /tmp/x \
+    && if [ -d /tmp/x/ps3dev ]; then cp -a /tmp/x/ps3dev/. /usr/local/ps3dev/; else cp -a /tmp/x/. /usr/local/ps3dev/; fi \
+    && rm -rf /tmp/x /tmp/t.tar.gz \
+    && wget -qO /usr/local/ps3dev/ppu/include/sysutil/sysutil.h https://raw.githubusercontent.com/ps3dev/PSL1GHT/master/ppu/include/sysutil/sysutil.h \
+    && /usr/local/ps3dev/ppu/bin/ppu-gcc --version | head -1
+
+COPY tools /opt/wili/tools
+COPY patches /opt/wili/patches
+
+RUN sed -i 's/curl -sL/wget -qO-/' /opt/wili/tools/build-ffmpeg.sh
+
+# FFmpeg before tiny3D: iterating on patches/tiny3d then only rebuilds the last
+# layer instead of redoing the (slow) FFmpeg build as well.
+RUN FFMPEG_PATCHES=/opt/wili/patches FFMPEG_PREFIX=/opt/ffmpeg-ps3 \
+    sh /opt/wili/tools/build-ffmpeg.sh \
+    && rm -rf /tmp/ffmpeg-src /tmp/ffmpeg-build
+
+RUN git clone --depth 1 https://github.com/wargio/tiny3D.git /tmp/tiny3D \
+    && patch -d /tmp/tiny3D -p1 < /opt/wili/patches/tiny3d/0001-rsx-init-trace.patch \
+    && make -C /tmp/tiny3D/lib install \
+    && rm -rf /tmp/tiny3D
+
+WORKDIR /ws/wilimini-ps3
+
+# ya2d_ps3 (same fork pkgi uses) provides the 2D quad/texture layer used by the UI.
+RUN git clone --depth 1 https://github.com/bucanero/ya2d_ps3.git /tmp/ya2d \
+    && make -C /tmp/ya2d/libya2d install \
+    && rm -rf /tmp/ya2d
