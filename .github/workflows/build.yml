@@ -29,7 +29,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -57,20 +57,19 @@ jobs:
             -e FFMPEG_PS3=/opt/ffmpeg-ps3 \
             -e PATH=/usr/local/ps3dev/ppu/bin:/usr/local/ps3dev/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             ${{ env.IMAGE }} \
-            sh -c 'make -j"$(nproc)" pkg && make -C probe -j"$(nproc)" pkg'
+            sh -c 'make -j"$(nproc)"'
           # 容器内以 root 构建，产物属于 root；改回 runner 用户，便于后续读取和清理。
-          sudo chown -R "$(id -u):$(id -g)" out probe/out build probe/build
+          sudo chown -R "$(id -u):$(id -g)" out build
 
       - name: Collect packages
         run: |
           mkdir -p dist
           cp out/*.pkg dist/
-          cp probe/out/*.pkg dist/
           test -s dist/pilis3.pkg
           ls -lh dist
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pkg-${{ github.sha }}
           path: dist/*.pkg
