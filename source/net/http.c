@@ -499,9 +499,23 @@ static int sockopt_cb(void *clientp, curl_socket_t fd, curlsocktype purpose)
     return CURL_SOCKOPT_OK;
 }
 
+/* Returning non-zero aborts the transfer: libcurl reports it as
+ * CURLE_ABORTED_BY_CALLBACK, which the caller sees as a normal error. */
+static int progress_cb(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                       curl_off_t ultotal, curl_off_t ulnow)
+{
+    const volatile int *cancel = (const volatile int *)clientp;
+
+    (void)dltotal;
+    (void)dlnow;
+    (void)ultotal;
+    (void)ulnow;
+    return (cancel && *cancel) ? 1 : 0;
+}
+
 static int http_do(const char *method, const char *url, const char *body,
                    HttpResponse *out, int timeout_sec, int verify,
-                   const char *range)
+                   const char *range, const volatile int *cancel)
 {
     CURL *curl;
     CURLcode rc;
@@ -582,6 +596,12 @@ static int http_do(const char *method, const char *url, const char *body,
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
     curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 20L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_sec);
+    if (cancel)
+    {
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_cb);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)cancel);
+    }
     if (range)
         curl_easy_setopt(curl, CURLOPT_RANGE, range);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -631,10 +651,14 @@ static int http_do(const char *method, const char *url, const char *body,
     {
         snprintf(out->error, sizeof(out->error), "%s",
                  error[0] ? error : curl_easy_strerror(rc));
-        log_printf("[http] #%d request failed rc=%d http=%ld after %ld ms "
-                   "(dns %ld / connect %ld / tls %ld / ttfb %ld): %s",
-                   req.id, (int)rc, out->status, curl_ms(total), curl_ms(dns),
-                   curl_ms(conn), curl_ms(tls), curl_ms(ttfb), out->error);
+        if (cancel && *cancel)
+            log_printf("[http] #%d cancelled", req.id);
+        else
+            log_printf("[http] #%d request failed rc=%d http=%ld after %ld ms "
+                       "(dns %ld / connect %ld / tls %ld / ttfb %ld): %s",
+                       req.id, (int)rc, out->status, curl_ms(total),
+                       curl_ms(dns), curl_ms(conn), curl_ms(tls),
+                       curl_ms(ttfb), out->error);
     }
 #if HTTP_TRACE
     else
@@ -654,13 +678,32 @@ static int http_do(const char *method, const char *url, const char *body,
 
 int http_get(const char *url, HttpResponse *out, int timeout_sec)
 {
-    int rc = http_do("GET", url, NULL, out, timeout_sec, 1, NULL);
+    int rc = http_do("GET", url, NULL, out, timeout_sec, 1, NULL, NULL);
     if (rc < 0 && (out->curl_code == CURLE_SSL_CACERT ||
                    out->curl_code == CURLE_SSL_CACERT_BADFILE ||
                    out->curl_code == CURLE_SSL_CONNECT_ERROR))
     {
         log_printf("[http] CA verify failed, retrying without verification");
-        rc = http_do("GET", url, NULL, out, timeout_sec, 0, NULL);
+        rc = http_do("GET", url, NULL, out, timeout_sec, 0, NULL, NULL);
+    }
+    return rc;
+}
+
+int http_get_range_ex(const char *url, long long start, long long end,
+                      HttpResponse *out, int timeout_sec,
+                      const volatile int *cancel)
+{
+    char range[64];
+    int rc;
+
+    snprintf(range, sizeof(range), "%lld-%lld", start, end);
+    rc = http_do("GET", url, NULL, out, timeout_sec, 1, range, cancel);
+    if (rc < 0 && (out->curl_code == CURLE_SSL_CACERT ||
+                   out->curl_code == CURLE_SSL_CACERT_BADFILE ||
+                   out->curl_code == CURLE_SSL_CONNECT_ERROR))
+    {
+        log_printf("[http] CA verify failed, retrying without verification");
+        rc = http_do("GET", url, NULL, out, timeout_sec, 0, range, cancel);
     }
     return rc;
 }
@@ -668,30 +711,18 @@ int http_get(const char *url, HttpResponse *out, int timeout_sec)
 int http_get_range(const char *url, long long start, long long end,
                    HttpResponse *out, int timeout_sec)
 {
-    char range[64];
-    int rc;
-
-    snprintf(range, sizeof(range), "%lld-%lld", start, end);
-    rc = http_do("GET", url, NULL, out, timeout_sec, 1, range);
-    if (rc < 0 && (out->curl_code == CURLE_SSL_CACERT ||
-                   out->curl_code == CURLE_SSL_CACERT_BADFILE ||
-                   out->curl_code == CURLE_SSL_CONNECT_ERROR))
-    {
-        log_printf("[http] CA verify failed, retrying without verification");
-        rc = http_do("GET", url, NULL, out, timeout_sec, 0, range);
-    }
-    return rc;
+    return http_get_range_ex(url, start, end, out, timeout_sec, NULL);
 }
 
 int http_post(const char *url, const char *body, HttpResponse *out, int timeout_sec)
 {
-    int rc = http_do("POST", url, body, out, timeout_sec, 1, NULL);
+    int rc = http_do("POST", url, body, out, timeout_sec, 1, NULL, NULL);
     if (rc < 0 && (out->curl_code == CURLE_SSL_CACERT ||
                    out->curl_code == CURLE_SSL_CACERT_BADFILE ||
                    out->curl_code == CURLE_SSL_CONNECT_ERROR))
     {
         log_printf("[http] CA verify failed, retrying without verification");
-        rc = http_do("POST", url, body, out, timeout_sec, 0, NULL);
+        rc = http_do("POST", url, body, out, timeout_sec, 0, NULL, NULL);
     }
     return rc;
 }

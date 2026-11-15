@@ -21,3 +21,6 @@
 # 构建产物只提交 EBOOT（build/pkg/USRDIR/EBOOT.BIN），.pkg 不进仓库
 !build/pkg/
 !probe/build/pkg/
+
+# 真机运行日志（含账号/播放地址），只留本机
+/pilis3.log

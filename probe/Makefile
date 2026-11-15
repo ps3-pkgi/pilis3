@@ -74,7 +74,26 @@ clean:
 	echo clean ...
 	rm -fr $(BUILD) $(OUTPUT).elf $(OUTPUT).self EBOOT.BIN
 
-pkg: clean $(BUILD) $(OUTPUT).pkg
+pkg: clean samples $(BUILD) $(OUTPUT).pkg
+
+#---------------------------------------------------------------------------------
+# Embedded test streams: sample_*.h264 -> source/sample_*.h
+# The headers are committed; the rule only runs when a stream is newer.
+#---------------------------------------------------------------------------------
+SAMPLES     :=	sample_1080p sample_720p sample_1080p_red
+SAMPLE_HDRS :=	$(addprefix source/,$(addsuffix .h,$(SAMPLES)))
+
+.PHONY: samples
+samples: $(SAMPLE_HDRS)
+
+source/%.h: %.h264
+	@echo gen $@ from $<
+	@{ \
+	  printf '/* generated from %s, %s bytes */\n#pragma once\n' '$<' "$$(wc -c < '$<')"; \
+	  printf 'static const unsigned char %s[] = {\n' '$*'; \
+	  od -An -v -tx1 '$<' | awk 'NF { s=""; for (i=1; i<=NF; i++) s = s (i>1 ? ", " : "") sprintf("0x%s", $$i); print "  " s "," }'; \
+	  printf '};\nstatic const unsigned int %s_size = %s;\n' '$*' "$$(wc -c < '$<')"; \
+	} > $@
 
 else
 

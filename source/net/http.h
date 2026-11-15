@@ -18,6 +18,10 @@ void http_shutdown(void);
 int http_get(const char *url, HttpResponse *out, int timeout_sec);
 int http_get_range(const char *url, long long start, long long end,
                    HttpResponse *out, int timeout_sec);
+/* Same, but aborts the transfer as soon as *cancel becomes non-zero. */
+int http_get_range_ex(const char *url, long long start, long long end,
+                      HttpResponse *out, int timeout_sec,
+                      const volatile int *cancel);
 int http_post(const char *url, const char *body, HttpResponse *out, int timeout_sec);
 void http_response_free(HttpResponse *res);
 

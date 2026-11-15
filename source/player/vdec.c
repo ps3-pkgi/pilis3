@@ -55,6 +55,10 @@ static u32 make_opd32(opd32 *out, void *func)
     return (u32)(uintptr_t)out;
 }
 
+static int picture_out(VdecCtx *c);
+static int pic_buffers_alloc(VdecCtx *c, u32 frame_cap);
+static void pic_buffers_free(VdecCtx *c);
+
 static u32 vdec_cb(u32 handle, u32 msgtype, u32 msgdata, u32 arg)
 {
     VdecCtx *c = (VdecCtx *)(uintptr_t)arg;
@@ -72,6 +76,9 @@ static u32 vdec_cb(u32 handle, u32 msgtype, u32 msgdata, u32 arg)
         break;
     case VDEC_CALLBACK_PICOUT:
         c->picout++;
+        /* Draining here is what keeps AUDONE flowing: a picture left in
+         * the decoder can block the AU we are waiting on. */
+        picture_out(c);
         break;
     case VDEC_CALLBACK_SEQDONE:
         c->seqdone++;
@@ -151,11 +158,11 @@ static int try_open(VdecCtx *c, int level, int spus)
     return 0;
 }
 
-int vdec_open(VdecCtx *c, int width, int height)
+int vdec_open(VdecCtx *c, int width, int height, u32 frame_cap)
 {
     static const int levels[] = {42, 41, 40};
     static const int spus[] = {4, 3, 2, 1};
-    int li, si;
+    int li, si, i;
 
     (void)width;
 
@@ -168,6 +175,19 @@ int vdec_open(VdecCtx *c, int width, int height)
         {
             if (try_open(c, levels[li], spus[si]) == 0)
             {
+                if (pic_buffers_alloc(c, frame_cap) < 0)
+                {
+                    log_printf("[vdec] picture buffers failed (%u bytes)",
+                               frame_cap);
+                    vdecClose(c->handle);
+                    sysMemoryFree((sys_mem_addr_t)(uintptr_t)c->mem);
+                    c->mem = NULL;
+                    c->open = 0;
+                    memset(c, 0, sizeof(*c));
+                    return -1;
+                }
+                for (i = 0; i < VDEC_AU_RING; ++i)
+                    c->au_pts[i] = -1;
                 c->disp_w = width;
                 c->disp_h = height;
                 log_printf("[vdec] ready %dx%d level=%d spus=%d", width, height,
@@ -205,6 +225,49 @@ int vdec_end_sequence(VdecCtx *c)
     return 0;
 }
 
+int vdec_flush_sequence(VdecCtx *c)
+{
+    int i;
+
+    if (!c->open)
+        return -1;
+
+    if (!c->ended && vdec_end_sequence(c) < 0)
+    {
+        /* Let vdec_close() retry the end sequence and take its usual
+         * "close skipped" path instead of closing a stuck handle. */
+        c->ended = 0;
+        log_printf("[vdec] cannot flush a stuck sequence");
+        return -1;
+    }
+
+    c->ended = 0;
+    c->seqdone = 0;
+    c->au_seq = 0;
+    c->pic_seq = 0;
+    for (i = 0; i < VDEC_AU_RING; ++i)
+        c->au_pts[i] = -1;
+    c->order_base = 0;
+    c->poc_ext = 0;
+    c->feed_count = 0;
+    c->pic_count = 0;
+    c->drop_count = 0;
+    c->pic_dropped = 0;
+
+    /* No callback can touch these until StartSequence returns. */
+    for (i = 0; i < VDEC_PIC_RING; ++i)
+        c->pic[i].state = VDEC_PIC_FREE;
+
+    if (vdecStartSequence(c->handle) < 0)
+    {
+        log_printf("[vdec] StartSequence failed");
+        return -1;
+    }
+
+    log_printf("[vdec] sequence restarted");
+    return 0;
+}
+
 int vdec_close(VdecCtx *c)
 {
     int closed = 0;
@@ -218,6 +281,7 @@ int vdec_close(VdecCtx *c)
             free(c->au_buf);
         c->au_buf = NULL;
         c->au_cap = 0;
+        pic_buffers_free(c);
         return 0;
     }
 
@@ -252,6 +316,7 @@ int vdec_close(VdecCtx *c)
         free(c->au_buf);
     c->au_buf = NULL;
     c->au_cap = 0;
+    pic_buffers_free(c);
     return 0;
 }
 
@@ -321,7 +386,63 @@ int vdec_feed(VdecCtx *c, const u8 *au, u32 len, long long pts, long long dts)
     return 0;
 }
 
-int vdec_get_picture(VdecCtx *c, u8 *out, u32 cap, VideoFrame *meta)
+/* ------------------------------------------------------------------------- */
+/* Picture output (runs on the VDEC callback thread)                         */
+/* ------------------------------------------------------------------------- */
+
+static int pic_free_slot(VdecCtx *c)
+{
+    int i;
+
+    for (i = 0; i < VDEC_PIC_RING; ++i)
+        if (c->pic[i].state == VDEC_PIC_FREE)
+            return i;
+    return -1;
+}
+
+static void pic_buffers_free(VdecCtx *c)
+{
+    int i;
+
+    for (i = 0; i < VDEC_PIC_RING; ++i)
+    {
+        if (c->pic[i].buf)
+            free(c->pic[i].buf);
+        c->pic[i].buf = NULL;
+        c->pic[i].state = VDEC_PIC_FREE;
+    }
+    c->pic_cap = 0;
+}
+
+static int pic_buffers_alloc(VdecCtx *c, u32 frame_cap)
+{
+    int i;
+
+    if (!frame_cap)
+        return -1;
+
+    c->pic_cap = frame_cap;
+    for (i = 0; i < VDEC_PIC_RING; ++i)
+    {
+        c->pic[i].buf = (u8 *)memalign(128, frame_cap);
+        if (!c->pic[i].buf)
+        {
+            pic_buffers_free(c);
+            return -1;
+        }
+        c->pic[i].f.data = c->pic[i].buf;
+        c->pic[i].state = VDEC_PIC_FREE;
+    }
+    log_printf("[vdec] %d picture buffers x %u bytes", VDEC_PIC_RING,
+               (u32)frame_cap);
+    return 0;
+}
+
+/* Every path out of here must give the picture item back to the decoder:
+ * either copy it (vdecGetPicture with a buffer) or release it (NULL). An
+ * item we forget to release stays in the decoder's output queue and the
+ * next AU never completes - that is the AUDONE timeout we kept hitting. */
+static int picture_out(VdecCtx *c)
 {
     u32 item = 0;
     s32 rc;
@@ -331,24 +452,39 @@ int vdec_get_picture(VdecCtx *c, u8 *out, u32 cap, VideoFrame *meta)
     u32 w, h, need, aligned_h, stride;
     u32 om, lo, hi_ts, au_idx;
     long long vpts, au_pts;
-    int p;
+    int p, slot;
 
-    if (!c->open || !out || !meta)
-        return -1;
+    fmt.format_type = VDEC_PICFMT_YUV420P;
+    fmt.color_matrix = VDEC_COLOR_MATRIX_BT601;
+    fmt.alpha = 0;
 
     rc = vdecGetPicItem(c->handle, &item);
     if (rc != 0 || !item)
         return ((u32)rc == VDEC_ERROR_EMPTY) ? 0 : -1;
 
     pic = (vdecPicture *)(uintptr_t)item;
-    if (!pic->codec_specific_addr)
-        return -1;
+
+    if (!pic->codec_specific_addr || pic->attr != 0)
+    {
+        vdecGetPicture(c->handle, &fmt, NULL);
+        c->pic_dropped++;
+        if (c->drop_count < 4)
+        {
+            log_printf("[vdec] drop attr=%u status=%u", pic->attr, pic->status);
+            c->drop_count++;
+        }
+        return 0;
+    }
 
     hi = (VdecH264InfoFixed *)(uintptr_t)pic->codec_specific_addr;
     w = hi->width;
     h = hi->height;
     if (!w || !h)
-        return -1;
+    {
+        vdecGetPicture(c->handle, &fmt, NULL);
+        c->pic_dropped++;
+        return 0;
+    }
 
     /* CellVdec pads the coded width and height to macroblock boundaries.
      * 852x480 becomes a 864-wide Y plane; copying it as 852-wide packed
@@ -371,6 +507,36 @@ int vdec_get_picture(VdecCtx *c, u8 *out, u32 cap, VideoFrame *meta)
     if (c->disp_h > 0 && (u32)c->disp_h < h)
         h = (u32)c->disp_h;
 
+    need = stride * aligned_h * 3 / 2;
+    if (need < pic->picture_size)
+        need = pic->picture_size;
+
+    if (need > c->pic_cap)
+    {
+        if (c->drop_count < 4)
+        {
+            log_printf("[vdec] frame %ux%u stride=%u needs %u > %u", w, h,
+                       stride, need, c->pic_cap);
+            c->drop_count++;
+        }
+        vdecGetPicture(c->handle, &fmt, NULL);
+        c->pic_dropped++;
+        return 0;
+    }
+
+    slot = pic_free_slot(c);
+    if (slot < 0)
+    {
+        /* Buffers are queued for the player or inside its reorder window.
+         * Drop this picture rather than block the decoder: blocking here
+         * is what used to stall AUDONE. */
+        vdecGetPicture(c->handle, &fmt, NULL);
+        c->pic_dropped++;
+        return 0;
+    }
+
+    c->pic[slot].state = VDEC_PIC_FILLING;
+
     /* Order by POC, not by decode/PTS order: B-frames come out of VDEC in
      * decode order and sorting them by PTS can still run backwards when the
      * stream's timestamps are DTS-like. This is Movian's POC extension. */
@@ -387,61 +553,84 @@ int vdec_get_picture(VdecCtx *c, u8 *out, u32 cap, VideoFrame *meta)
         if (p == 0)
             c->order_base += 0x100000000LL;
     }
-    need = stride * aligned_h * 3 / 2;
-    if (need < pic->picture_size)
-        need = pic->picture_size;
-    if (need > cap)
-    {
-        log_printf("[vdec] frame %ux%u stride=%u needs %u > %u", w, h, stride,
-                   need, cap);
-        return -1;
-    }
 
-    memset(&fmt, 0, sizeof(fmt));
-    fmt.format_type = VDEC_PICFMT_YUV420P;
-    fmt.color_matrix = VDEC_COLOR_MATRIX_BT601;
-    fmt.alpha = 0;
-
-    rc = vdecGetPicture(c->handle, &fmt, out);
+    rc = vdecGetPicture(c->handle, &fmt, c->pic[slot].buf);
     if (rc < 0)
     {
         log_printf("[vdec] getPicture rc=%08x", (u32)rc);
-        return -1;
+        c->pic[slot].state = VDEC_PIC_FREE;
+        c->pic_dropped++;
+        return 0;
     }
 
-    meta->data = out;
-    meta->size = need;
-    meta->w = (int)w;
-    meta->h = (int)h;
     lo = pic->pts[0].low;
     hi_ts = pic->pts[0].hi;
     vpts = (long long)(((u64)hi_ts << 32) | lo);
     if (lo == 0xffffffffu || vpts <= 0)
         vpts = 0;
 
-    /* VDEC leaves pts[] zero on these streams; the AU userdata still points
-     * at the packet timestamp we fed. Movian uses the same packet-metadata
-     * ring, so take the display PTS from there. */
-    au_idx = (u32)pic->userdata[0];
-    au_pts = c->au_pts[au_idx & (VDEC_AU_RING - 1)];
-    if (au_pts > 0)
+    /* VDEC leaves pts[] zero and does not round-trip AU userdata on this
+     * firmware (pictures always report 0), so map the picture to the AU by
+     * output order: one picture per AU, in decode order. That gives every
+     * frame its real packet timestamp, which keeps the player clock honest
+     * no matter how long the reorder window holds a GOP. */
+    au_idx = c->pic_seq & (VDEC_AU_RING - 1);
+    au_pts = c->au_pts[au_idx];
+    c->pic_seq++;
+    if (au_pts >= 0)
         vpts = au_pts;
 
-    meta->layout_h = (int)aligned_h;
-    meta->stride = (int)stride;
-    meta->pts = vpts;
-    meta->order = (long long)c->order_base + om;
+    c->pic[slot].f.size = need;
+    c->pic[slot].f.w = (int)w;
+    c->pic[slot].f.h = (int)h;
+    /* The decoder reports picture_size with the macroblock padded height,
+     * but packs the chroma planes at the visible height: probe's red-frame
+     * test showed U/V start at w*height, not w*aligned_h. Keep the padded
+     * size for the copy, use the visible height for the plane offsets. */
+    c->pic[slot].f.layout_h = (int)h;
+    c->pic[slot].f.stride = (int)stride;
+    c->pic[slot].f.pts = vpts;
+    c->pic[slot].f.order = (long long)c->order_base + om;
     if (p == 3 && c->poc_ext == 0)
-        meta->order = (long long)c->order_base + om - 0x100000000LL;
+        c->pic[slot].f.order = (long long)c->order_base + om - 0x100000000LL;
 
     if (c->pic_count < 8)
     {
         log_printf("[vdec] pic[%d] %ux%u stride=%u plane_h=%u poc=%u "
-                   "order=%lld user=%u pts=%lld",
+                   "order=%lld au=%u pts=%lld",
                    c->pic_count, w, h, stride, aligned_h, om,
-                   meta->order, au_idx, meta->pts);
+                   c->pic[slot].f.order, au_idx, c->pic[slot].f.pts);
         c->pic_count++;
     }
 
+    /* Publish only after the pixel data and metadata are in place. */
+    __sync_synchronize();
+    c->pic[slot].state = VDEC_PIC_READY;
     return 1;
+}
+
+int vdec_pic_take(VdecCtx *c, VdecPic *out)
+{
+    int i;
+
+    if (!c->open || !out)
+        return 0;
+
+    for (i = 0; i < VDEC_PIC_RING; ++i)
+    {
+        if (c->pic[i].state != VDEC_PIC_READY)
+            continue;
+        __sync_synchronize();
+        c->pic[i].state = VDEC_PIC_IN_USE;
+        out->slot = (u32)i;
+        out->f = c->pic[i].f;
+        return 1;
+    }
+    return 0;
+}
+
+void vdec_pic_release(VdecCtx *c, u32 slot)
+{
+    if (c && slot < VDEC_PIC_RING && c->pic[slot].state == VDEC_PIC_IN_USE)
+        c->pic[slot].state = VDEC_PIC_FREE;
 }

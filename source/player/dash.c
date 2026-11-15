@@ -40,6 +40,13 @@ static int parse_range(const char *s, u64 *start, u64 *end)
 int dash_load(const char *url, const char *init_range, const char *index_range,
               DashIndex *idx, char *err, int err_size)
 {
+    return dash_load_ex(url, init_range, index_range, idx, err, err_size, NULL);
+}
+
+int dash_load_ex(const char *url, const char *init_range, const char *index_range,
+                 DashIndex *idx, char *err, int err_size,
+                 const volatile int *cancel)
+{
     u64 init_start, init_end, index_start, index_end;
     HttpResponse res;
     u8 *index = NULL;
@@ -55,8 +62,8 @@ int dash_load(const char *url, const char *init_range, const char *index_range,
         return -1;
     }
 
-    if (http_get_range(url, (long long)init_start, (long long)init_end, &res, 15) <
-            0 ||
+    if (http_get_range_ex(url, (long long)init_start, (long long)init_end, &res,
+                          15, cancel) < 0 ||
         !res.body || res.len == 0)
     {
         snprintf(err, err_size, "初始化段下载失败: %s", res.error);
@@ -75,8 +82,15 @@ int dash_load(const char *url, const char *init_range, const char *index_range,
     idx->init_len = (u32)res.len;
     http_response_free(&res);
 
-    if (http_get_range(url, (long long)index_start, (long long)index_end, &res, 15) <
-            0 ||
+    if (cancel && *cancel)
+    {
+        snprintf(err, err_size, "已取消");
+        dash_free(idx);
+        return -1;
+    }
+
+    if (http_get_range_ex(url, (long long)index_start, (long long)index_end, &res,
+                          15, cancel) < 0 ||
         !res.body || res.len == 0)
     {
         snprintf(err, err_size, "索引段下载失败: %s", res.error);

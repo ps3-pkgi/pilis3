@@ -1439,19 +1439,7 @@ int app_run(void)
             }
             else if (pr == 2)
             {
-                double target = player_seek_target(g_player);
-                player_close(g_player);
-                g_player = player_open_at(&g_play, &g_detail, target);
-                if (!g_player || player_failed(g_player))
-                {
-                    if (g_player)
-                    {
-                        player_close(g_player);
-                        g_player = NULL;
-                    }
-                    snprintf(g_error, sizeof(g_error), "跳转失败");
-                    g_screen = SCREEN_DETAIL;
-                }
+                /* player_update() already jumped; keep the session alive. */
                 continue;
             }
             else if (pr == 3)

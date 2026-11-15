@@ -1,10 +1,10 @@
 # pilis3 进展状态
 
-> 更新于 2026-11-14。最近一次**上机验证**的是 2026-11-14 的包（curl 阶段日志）；
-> 首页列表、PPU 软解播放和 **VDEC 硬解 probe** 都已跑通。
+> 更新于 2026-11-15。最近一次**上机验证**的是 2026-11-15 的包（720p 硬解连续
+> 播放，用户确认不再卡顿）；VDEC 硬解播放器已跑通，原地 seek 已实现、待复验。
 >
-> 一句话：RSX 通路、HTTPS、首页列表、软解播放和 VDEC 硬解都已在真机上跑通；
-> 播放器接入 VDEC 是下一步。
+> 一句话：VDEC 硬解 720p 已经能连续流畅播放；1080p 解码通路可用，换成真实
+> PTS 之后还没复验。
 
 ## 1. 已在真机验证
 
@@ -18,6 +18,10 @@
 | 明文 HTTP | 正常 | probe 拿到 307 并跟随重定向，`Connection #0 left intact` |
 | HTTPS / TLS | **已通** | `Handshake complete, cipher is TLS-ECDHE-RSA-WITH-AES-128-GCM-SHA256` → `[http] #N -> 200 (259 bytes)` |
 | VDEC 硬解 | **可用（probe）** | 2026-11-14 真机：H.264 1080p/720p 均出帧，`pics=4/14/14`、`[vdec] close returned`；配置见 [docs/decoding.md](docs/decoding.md) |
+| VDEC 硬解播放 | **480p/720p 正常** | 2026-11-14 的 852x480、2026-11-15 的 1280x720 均连续播放；720p 用户确认不再卡顿；见 2.12～2.13 |
+| 原地 seek | 已实现，待复验 | `EndSequence`+`StartSequence`，日志 `[vdec] sequence restarted`，不再重新分配 52 MB；见 2.14 |
+| sidx 后台预取 | **正常** | `[player] indexes ready (v=1 a=1)`；关闭时在途请求可中断；见 2.15 |
+| H.264 参考帧预检 | 已实现，待样本 | SPS 解析用 probe 样本校验过；还没遇到 refs 超限的真实流；见 2.16 |
 | 首页列表 | **正常** | 2026-11-14 上机：推荐列表正常返回并显示 |
 | PPU 软解 | **可播放** | 2026-11-14 上机：libavcodec 软解出画面；分辨率、帧率、音频/弹幕待补 |
 
@@ -118,14 +122,65 @@ AUDONE 时持续调用 `vdec_pump` 取 PICOUT；presenter 3 秒不动就报错�
 `VdecCtx` 改堆分配，卡住时保留 context 不释放并在本次运行禁用 VDEC。480p
 （852x480）已上机连续播放通过。
 
+### 2.12 硬解播放：回调取图、坏帧归还与解码节流
+
+三个独立的坑叠在一起，表现都是"卡住"：
+
+1. **AUDONE 被取图方式饿死**。原来播放线程有槽位才 `vdecGetPicItem`，呈现一慢，
+   解码器的输出队列就满，当前 AU 完不成，`AUDONE` 永远不来。现在 `PICOUT`
+   回调里直接取图到 16 个槽的环里（`vdec.c: picture_out`），解码器永远有人收图。
+2. **失败路径不归还 pic item**。宽高非法、`attr != 0`、缓冲不够时原来直接
+   return，item 留在解码器里，几个坏帧之后同样把队列堵死。现在所有失败路径都走
+   `vdecGetPicture(..., NULL)` 归还。
+3. **队列满该等还是该丢**。试过"队列满就丢"，结果解码线程全速跑（低码率 720p
+   能到 80 fps），而每丢一帧合成时钟还前进 33 ms，活下来的帧间隔越来越大，
+   播放变成几秒一帧。现在恢复"等空槽"做节流——回调已经在独立收图，等不会饿死
+   解码器；只有落后音频时钟超过 250 ms 的帧才在呈现端丢掉。
+
+### 2.13 时间轴：合成 PTS 与 B 帧重排
+
+`pic->userdata` 在这台固件上恒为 0，AU 的 PTS 取不回来，于是每帧的显示时间靠
+"上一帧 + frame_dur" 合成。实测流是 I + P(16) + 7 个 B 帧的 9 帧 GOP，重排窗口
+要憋一整个 GOP 才能定序；一憋住，合成时钟就落在真实时间后面，呈现端只能丢帧追，
+日志里是 `skipped` 暴涨和 `emit order backwards`，画面几秒一帧。
+
+现在按"输出顺序对回送进去的 AU"取**真实包 PTS**（一图一 AU、解码顺序），
+重排窗口 8 → 12、图片环 12 → 16，窗口不会再被 GOP 填满。日志里
+`pic … au=0 pts=0`、`au=1 pts=26668` 就是解码顺序的真实时间戳（不递增正常）。
+
+### 2.14 原地 seek：EndSequence + StartSequence
+
+seek 原来是关掉播放器再 `player_open_at`，等于重新分配 52 MB、重新 open VDEC、
+重新下载 sidx。现在 `player_seek()` 只停视频线程，`VdecCtx` 挂在 `Player` 上，
+下次播放用 `vdec_flush_sequence()` 做 `EndSequence` + `StartSequence`，清 POC 和
+AU 映射后接着解；显示队列在线程 join 之后排空。音频重新起一个解码器，DASH 索引
+缓存在 `Player` 里（`vidx`/`aidx`），seek 只做 `dash_find`。
+
+### 2.15 sidx 预取与可中断 HTTP
+
+播放一开始就在后台线程拉视频/音频的 sidx（`[player] indexes ready`），第一次
+seek 不再等网络。预取线程检查 `p->idx_cancel`；`http_do` 增加了可选的 cancel
+回调（`CURLOPT_XFERINFOFUNCTION`），关闭播放器时在途的 range 请求会立刻以
+`CURLE_ABORTED_BY_CALLBACK` 结束，不用等 15 s 超时。阻塞 DNS 阶段仍然中断不了，
+这是 PS3 portlibs 的限制。
+
+### 2.16 参考帧预检
+
+CellVdec 的工作区只按 level 分配，1080p 下 DPB 放不下太多参考帧。照 Movian 的
+判据（`mb_height >= 68` 时 refs > 4、`>= 45` 时 > 9），在打开前解析 SPS
+（`source/player/h264info.c`）拒绝这类流并回退软解，避免解到一半 `AUDONE`
+不再来。解析器用 probe 的两个样本对过：1080p 样本 `1920x1080 / mb 120x68 /
+refs=3`，720p 样本 `1280x720 / mb 80x45 / refs=3`。
+
 ## 3. 待验证 / 未完成
 
 | 项 | 说明 |
 | --- | --- |
-| 性能 | 720P 预期 25–40 fps（qpel/chroma 有 Altivec，deblock/IDCT 仍是纯 C）；1080P 不建议 |
+| 性能 | 软解只吃一个 PPU 核（qpel/chroma 有 Altivec，deblock/IDCT 仍是纯 C）：720P 25–40 fps、1080P 十几帧。硬解 720p 已流畅，1080p 待复验 |
 | 字体 | 日志里 `[text] fonts latin=0 cgb=0 jpn=0 kor=0`，需要确认 libfont 的 `TTFLoadFont` 返回 0 是成功还是失败；若失败则文字不显示 |
 | probe 目录 | **已上机通过**（2026-11-14）：`pics=4/14/14`、`close returned`；产物 `probe/out/vdec_probe.pkg` |
-| 播放器接 VDEC | **480p 已上机通过**（2026-11-14）：852x480 连续播放正常；设置可切软解；720p/1080p 待验证 |
+| 播放器接 VDEC | **480p/720p 已上机通过**（2026-11-15）：720p 连续播放，用户确认不再卡顿；设置可切软解；1080p 待复验 |
+| 1080p 内存 | 图片环 16 × 3.1 MB + 52 MB 工作区；若 VDEC 打开失败会回退软解，按分辨率收窄缓冲可缓解 |
 | 其它功能 | 二维码登录、弹幕、收藏/稍后再看/历史 均未在真机验证 |
 
 ## 4. 日志判读
@@ -145,7 +200,14 @@ AUDONE 时持续调用 `vdec_pump` 取 PICOUT；presenter 3 秒不动就报错�
 | `[app] exit: cancel on tab …` / `system request` | 主循环收到的退出原因；没有这类行就中断才是真崩溃 |
 | `[bili] wbi ready` / `recommend page N: M items` | 接口层结果 |
 | `[player] software decode WxH` | 软解初始化成功 |
-| `[vdec] …` / `[t3d] …` | 只在 probe 包和 t3D 初始化阶段出现 |
+| `[player] indexes ready (v=… a=…)` | sidx 预取完成；第一次 seek 不用等网络 |
+| `[vdec] 16 picture buffers x …` | 图片环分配；1080p 每块约 3.1 MB |
+| `[vdec] pic[N] … au=%u pts=%lld` | `au` 是输出顺序对回的 AU 号（应连续），`pts` 是真实包时间戳（解码顺序，不递增正常） |
+| `[player] stat wall=… clock=… shown=… skip=…` | 每 2 秒一行；`clock` ≈ `wall` 减 VDEC 打开耗时，`skip` 应接近 0 |
+| `[vdec] sequence restarted` | 原地 seek 的 flush，看到它就说明没有重新 open 解码器 |
+| `[player] reorder window full, emitting anyway` | POC 断层把重排窗口填满，已强制出帧；偶发一次正常 |
+| `[player] vdec done … skipped=%d dropped=%u` | 收尾统计；两个数大说明节流或时间轴有问题 |
+| `[vdec] …` / `[t3d] …` | probe 包、t3D 初始化；播放器硬解时也会出现 `[vdec]` 行 |
 
 卡住时只看最后几行：
 
@@ -171,7 +233,7 @@ make -j8 pkg          # 产物：out/pilis3.pkg + build/pkg/USRDIR/EBOOT.BIN
   去掉每帧的 MakeCmdSpace 日志，恢复 `gcmSetWaitFlip()`）；
 - FFmpeg 用 `tools/build-ffmpeg.sh` 构建（已开 Altivec，`--disable-asm` 已移除）。
 
-## 6. 本轮提交索引
+## 6. 提交索引（2026-11-14）
 
 | 提交 | 内容 |
 | --- | --- |
@@ -188,3 +250,15 @@ make -j8 pkg          # 产物：out/pilis3.pkg + build/pkg/USRDIR/EBOOT.BIN
 | `5a607b7` | tiny3D 恢复 `gcmSetWaitFlip()`（修闪屏） |
 | `96a17c6` | 网络 bring-up 移植自 wilimini/wilips3 |
 | `03d2dea` | `sys_sem_create()` 修 0x8001000d |
+
+## 7. 提交索引（2026-11-15）
+
+| 提交 | 内容 |
+| --- | --- |
+| `3ebf0a0` | 每帧改用真实包 PTS（按输出顺序对回 AU）；重排窗口 12、图片环 16 |
+| `5fda078` | 重排窗口重锚定（**已被 3ebf0a0 取代**，会造成乱序） |
+| `e30e4c6` | 窗口满时强制出帧，破 B 帧重排死锁 |
+| `7377e5d` | 队列满恢复等待节流；迟到 250 ms 才丢帧；abort 不再当作解码失败 |
+| `53bac60` | .gitignore 忽略真机日志 |
+| `7c4e7d8` | probe README；Makefile 从 .h264 生成 sample 头文件 |
+| `beb689a` | 回调取图 + 坏帧归还、原地 seek、参考帧预检、sidx 预取 |

@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "danmaku.h"
 #include "dash.h"
+#include "h264info.h"
 #include "platform/gfx.h"
 #include "platform/log.h"
 #include "platform/settings.h"
@@ -65,7 +66,6 @@ struct Player
     double start_time;
     double clock_base;
     double video_base;
-    double seek_target;
     int quality_delta;
     u8 *vprefix;
     u32 vprefix_len;
@@ -76,14 +76,33 @@ struct Player
     char error_text[160];
 
     int vdec_emit_count;
+    volatile int vdec_skipped;
     long long vdec_last_order;
     long long vdec_next_pts;
     long long vdec_frame_dur;
     long long vdec_max_order;
     long long vdec_flush_to;
     int vdec_have_order;
+    int vdec_forced;
     int audio_waiting;
     int present_count;
+    int shown_total;
+    u64 next_stat_ms;
+
+    /* The VDEC session outlives a seek: EndSequence/StartSequence flush the
+     * decoder instead of tearing down and reopening it. */
+    VdecCtx *vc;
+    int vdec_restart;
+
+    /* DASH indexes are cached so only the first seek pays for the download,
+     * and prefetched in the background right after playback starts. */
+    DashIndex vidx;
+    DashIndex aidx;
+    int have_vidx;
+    int have_aidx;
+    sys_ppu_thread_t idx_thread;
+    int idx_started;
+    volatile int idx_cancel;
 
     int paused;
     u64 start_ms;
@@ -218,16 +237,23 @@ static int frame_to_slot(const AVFrame *f, u8 *dst, u32 cap, VideoFrame *meta,
 /* VDEC hardware path                                                        */
 /* ------------------------------------------------------------------------- */
 
-#define VDEC_REORDER 8
+#define VDEC_REORDER 12
 
 typedef struct
 {
-    u8 *buf;
+    u32 slot;
     VideoFrame meta;
     int used;
 } VdecReorder;
 
-static int vdec_wait_free(Player *p)
+/* Grab a display slot. The decode thread must never sleep on the presenter:
+ * when the queue is full the caller drops the frame and keeps decoding. Only
+ * a presenter that has not freed a slot for three seconds counts as wedged. */
+/* Flow control: the player thread waits here while the display queue is
+ * full. The decoder itself never blocks on this (the PICOUT callback drains
+ * it), so waiting only paces the player thread. A presenter that frees no
+ * slot for three seconds is treated as wedged. */
+static int vdec_take_slot(Player *p)
 {
     u64 start = sys_ms();
     int logged = 0;
@@ -271,15 +297,17 @@ static long long vdec_smallest_order(VdecReorder *r)
 }
 
 /* Emit the smallest POC order held by the reorder buffer, but only when it is
- * no greater than limit (Movian's flush_to lookahead). */
-static void vdec_emit_smallest(Player *p, VdecReorder *r, int *count,
-                               long long limit)
+ * no greater than limit (Movian's flush_to lookahead).
+ * Returns 0 when a frame was emitted or deliberately skipped, -1 when the
+ * player is shutting down or the presenter stopped consuming entirely. */
+static int vdec_emit_smallest(Player *p, VdecCtx *vc, VdecReorder *r,
+                              int *count, long long limit)
 {
     int i, best = -1;
     long long best_order = 0;
 
     if (*count <= 0)
-        return;
+        return 0;
 
     for (i = 0; i < VDEC_REORDER; ++i)
     {
@@ -292,18 +320,20 @@ static void vdec_emit_smallest(Player *p, VdecReorder *r, int *count,
         }
     }
     if (best < 0)
-        return;
+        return 0;
     if (limit != LLONG_MAX && best_order > limit)
-        return;
-    if (vdec_wait_free(p) < 0)
-        return;
+        return 0;
 
     /* Use the AU PTS from userdata when VDEC provided one; fall back to a
-     * monotonic frame clock only if it did not. */
+     * monotonic frame clock only if it did not. The clock advances for
+     * skipped frames too, so pacing does not fall behind. */
     if (r[best].meta.pts <= 0)
         r[best].meta.pts = p->vdec_next_pts;
     p->vdec_next_pts = r[best].meta.pts +
                        (p->vdec_frame_dur > 0 ? p->vdec_frame_dur : 3000);
+
+    if (vdec_take_slot(p) < 0)
+        return -1;
 
     if (p->vdec_emit_count < 16)
         log_printf("[player] vdec emit #%d order=%lld pts=%lld count=%d",
@@ -326,6 +356,9 @@ static void vdec_emit_smallest(Player *p, VdecReorder *r, int *count,
         sysSemPost(p->data_sem, 1);
     }
 
+    /* The slot is copied out, so the decoder may reuse it now. */
+    vdec_pic_release(vc, r[best].slot);
+
     if (p->audio_waiting && p->audio)
     {
         p->audio_waiting = 0;
@@ -336,6 +369,7 @@ static void vdec_emit_smallest(Player *p, VdecReorder *r, int *count,
 
     r[best].used = 0;
     (*count)--;
+    return 0;
 }
 
 static void vdec_pump(Player *p, VdecCtx *vc, VdecReorder *r, int *count)
@@ -343,8 +377,7 @@ static void vdec_pump(Player *p, VdecCtx *vc, VdecReorder *r, int *count)
     for (;;)
     {
         int i, free_idx = -1;
-        VideoFrame meta;
-        int got;
+        VdecPic pic;
 
         if (p->abort || p->vdec_stalled)
             break;
@@ -364,36 +397,55 @@ static void vdec_pump(Player *p, VdecCtx *vc, VdecReorder *r, int *count)
             {
                 while (*count > 0 &&
                        vdec_smallest_order(r) <= p->vdec_flush_to)
-                    vdec_emit_smallest(p, r, count, p->vdec_flush_to);
+                {
+                    if (vdec_emit_smallest(p, vc, r, count,
+                                           p->vdec_flush_to) < 0)
+                        return;
+                }
             }
             if (*count >= VDEC_REORDER)
-                break;
+            {
+                /* POC gap wider than the window: emit the smallest anyway.
+                 * Every frame carries its real packet PTS now, so this only
+                 * gives up the lookahead a full window cannot afford. */
+                if (!p->vdec_forced)
+                {
+                    log_printf("[player] reorder window full, emitting anyway");
+                    p->vdec_forced = 1;
+                }
+                if (vdec_emit_smallest(p, vc, r, count, LLONG_MAX) < 0)
+                    return;
+            }
             continue;
         }
 
-        got = vdec_get_picture(vc, r[free_idx].buf, VFRAME_MAX, &meta);
-        if (got <= 0)
+        if (vdec_pic_take(vc, &pic) <= 0)
             break;
 
         if (!p->vdec_have_order)
         {
-            p->vdec_max_order = meta.order;
+            p->vdec_max_order = pic.f.order;
             p->vdec_have_order = 1;
         }
-        else if (meta.order > p->vdec_max_order)
+        else if (pic.f.order > p->vdec_max_order)
         {
             p->vdec_flush_to = p->vdec_max_order;
-            p->vdec_max_order = meta.order;
+            p->vdec_max_order = pic.f.order;
         }
 
-        r[free_idx].meta = meta;
+        r[free_idx].slot = pic.slot;
+        r[free_idx].meta = pic.f;
         r[free_idx].used = 1;
         (*count)++;
 
         if (p->vdec_flush_to >= 0)
         {
             while (*count > 0 && vdec_smallest_order(r) <= p->vdec_flush_to)
-                vdec_emit_smallest(p, r, count, p->vdec_flush_to);
+            {
+                if (vdec_emit_smallest(p, vc, r, count,
+                                       p->vdec_flush_to) < 0)
+                    return;
+            }
         }
     }
 }
@@ -416,6 +468,49 @@ static int vdec_wait_audone(Player *p, VdecCtx *vc, VdecReorder *r, int *count,
     return (p->abort || p->vdec_stalled) ? -1 : 0;
 }
 
+/* CellVdec sizes its work area from the level alone, so the DPB cannot hold
+ * as many reference frames as a desktop decoder. Movian refuses streams past
+ * the hardware limit; without this the decoder stalls mid-stream and never
+ * reports AUDONE. Limits from its h264_parser check. */
+static int vdec_refs_supported(const AVCodecParameters *par)
+{
+    H264StreamInfo si;
+
+    if (h264_parse_extradata(par->extradata, par->extradata_size, &si) < 0)
+        return 1;
+
+    if (si.mb_height >= 68 && si.num_ref_frames > 4)
+    {
+        log_printf("[vdec] %dx%d needs %d ref frames; CellVdec supports 4 at "
+                   "this size", si.width, si.height, si.num_ref_frames);
+        return 0;
+    }
+    if (si.mb_height >= 45 && si.num_ref_frames > 9)
+    {
+        log_printf("[vdec] %dx%d needs %d ref frames; CellVdec supports 9 at "
+                   "this size", si.width, si.height, si.num_ref_frames);
+        return 0;
+    }
+    return 1;
+}
+
+/* Close the VDEC session owned by the player. A stuck sequence is left alive
+ * (the firmware still holds the context) and VDEC is disabled for the run. */
+static void vdec_release(Player *p)
+{
+    if (!p->vc)
+        return;
+
+    if (vdec_close(p->vc) == 0)
+        free(p->vc);
+    else
+    {
+        g_vdec_disabled = 1;
+        log_printf("[player] vdec disabled for this run (session stuck)");
+    }
+    p->vc = NULL;
+}
+
 static int vdec_playback(Player *p, AVFormatContext *fmt, int vstream, AVRational tb)
 {
     const AVStream *st = fmt->streams[vstream];
@@ -427,21 +522,44 @@ static int vdec_playback(Player *p, AVFormatContext *fmt, int vstream, AVRationa
     VdecReorder reorder[VDEC_REORDER];
     int count = 0;
     int failed = 0;
-    int i;
+    u32 dropped = 0;
     int ret = -1;
     long long last_pts = 0;
 
-    vc = (VdecCtx *)calloc(1, sizeof(*vc));
-    if (!vc)
+    if (st->codecpar->codec_id == AV_CODEC_ID_H264 &&
+        !vdec_refs_supported(st->codecpar))
         return -1;
 
+    if (!p->vc)
+    {
+        p->vc = (VdecCtx *)calloc(1, sizeof(*p->vc));
+        if (!p->vc)
+            return -1;
+        if (vdec_open(p->vc, st->codecpar->width, st->codecpar->height,
+                      VFRAME_MAX) < 0)
+        {
+            free(p->vc);
+            p->vc = NULL;
+            return -1;
+        }
+    }
+    else if (p->vdec_restart)
+    {
+        /* Same codec, new position: flush in place instead of reopening. */
+        p->vdec_restart = 0;
+        if (vdec_flush_sequence(p->vc) < 0)
+        {
+            log_printf("[player] vdec flush failed, falling back to software");
+            g_vdec_disabled = 1;
+            return -1;
+        }
+    }
+
+    vc = p->vc;
     p->vdec_flush_to = -1;
     p->vdec_have_order = 0;
     p->vdec_max_order = 0;
     memset(reorder, 0, sizeof(reorder));
-
-    if (vdec_open(vc, st->codecpar->width, st->codecpar->height) < 0)
-        goto done;
 
     filter = av_bsf_get_by_name("h264_mp4toannexb");
     if (!filter)
@@ -475,13 +593,6 @@ static int vdec_playback(Player *p, AVFormatContext *fmt, int vstream, AVRationa
     out = av_packet_alloc();
     if (!pkt || !out)
         goto done;
-
-    for (i = 0; i < VDEC_REORDER; ++i)
-    {
-        reorder[i].buf = (u8 *)memalign(128, VFRAME_MAX);
-        if (!reorder[i].buf)
-            goto done;
-    }
 
     ret = 0;
 
@@ -587,32 +698,25 @@ static int vdec_playback(Player *p, AVFormatContext *fmt, int vstream, AVRationa
         if (vdec_end_sequence(vc) == 0)
             vdec_pump(p, vc, reorder, &count);
         while (count > 0 && !p->abort)
-            vdec_emit_smallest(p, reorder, &count, LLONG_MAX);
-    }
-
-done:
-    if (vc)
-    {
-        if (vdec_close(vc) == 0)
-            free(vc);
-        else
         {
-            g_vdec_disabled = 1;
-            log_printf("[player] vdec disabled for this run (session stuck)");
+            if (vdec_emit_smallest(p, vc, reorder, &count, LLONG_MAX) < 0)
+                break;
         }
     }
 
-    for (i = 0; i < VDEC_REORDER; ++i)
-    {
-        if (reorder[i].buf)
-            free(reorder[i].buf);
-    }
+done:
+    /* An abort (pause/seek/close) is not a decoder failure. */
+    if (failed && !p->abort)
+        ret = -1;
+    dropped = vc ? vc->pic_dropped : 0;
+
     av_packet_free(&pkt);
     av_packet_free(&out);
     av_bsf_free(&bsfc);
 
-    log_printf("[player] vdec done, frames left=%d failed=%d emitted=%d", count,
-               failed, p->vdec_emit_count);
+    log_printf("[player] vdec done, frames left=%d failed=%d emitted=%d "
+               "skipped=%d dropped=%u",
+               count, failed, p->vdec_emit_count, p->vdec_skipped, dropped);
     return ret;
 }
 
@@ -696,6 +800,7 @@ static void video_thread(void *arg)
             sysThreadExit(0);
         }
         log_printf("[player] VDEC unavailable, falling back to software");
+        vdec_release(p);
     }
 
     /* Software path: packets are AVCC; libavcodec handles them directly. */
@@ -860,6 +965,8 @@ static void present_frame(Player *p)
     p->last_h = f->h;
     p->last_disp_h = disp_h;
 
+    p->shown_total++;
+
     if (p->present_count < 16)
     {
         double clk = player_clock(p) - p->clock_base;
@@ -925,6 +1032,155 @@ Player *player_open(const PlayUrl *play, const VideoItem *item)
     return player_open_at(play, item, 0.0);
 }
 
+/* Loading the sidx costs a couple of range requests. Do it right after
+ * playback starts so the first seek does not have to wait for the network. */
+static void index_thread(void *arg)
+{
+    Player *p = (Player *)arg;
+    char err[128];
+
+    if (p->play.video_index[0])
+    {
+        if (dash_load_ex(p->play.video_url, p->play.video_init,
+                         p->play.video_index, &p->vidx, err, sizeof(err),
+                         &p->idx_cancel) == 0)
+            p->have_vidx = 1;
+        else if (!p->idx_cancel)
+            log_printf("[player] video index prefetch failed: %s", err);
+    }
+
+    if (!p->idx_cancel && p->play.audio_url[0] && p->play.audio_index[0])
+    {
+        if (dash_load_ex(p->play.audio_url, p->play.audio_init,
+                         p->play.audio_index, &p->aidx, err, sizeof(err),
+                         &p->idx_cancel) == 0)
+            p->have_aidx = 1;
+        else if (!p->idx_cancel)
+            log_printf("[player] audio index prefetch failed: %s", err);
+    }
+
+    if (!p->idx_cancel)
+        log_printf("[player] indexes ready (v=%d a=%d)", p->have_vidx,
+                   p->have_aidx);
+    sysThreadExit(0);
+}
+
+static void index_prefetch_start(Player *p)
+{
+    if (p->idx_started || p->have_vidx || !p->play.video_index[0])
+        return;
+
+    if (sysThreadCreate(&p->idx_thread, index_thread, p, 1200, 0x40000, 0,
+                        "pilis3idx") < 0)
+    {
+        log_printf("[player] index prefetch thread failed");
+        return;
+    }
+    p->idx_started = 1;
+}
+
+/* Waits for the prefetch; a no-op when it already finished or never ran. */
+static void index_prefetch_join(Player *p)
+{
+    if (!p->idx_started)
+        return;
+    sysThreadJoin(p->idx_thread, NULL);
+    p->idx_started = 0;
+}
+
+static int replace_prefix(u8 **dst, u32 *dst_len, const u8 *src, u32 len)
+{
+    u8 *buf = NULL;
+
+    if (src && len)
+    {
+        buf = (u8 *)malloc(len);
+        if (!buf)
+            return -1;
+        memcpy(buf, src, len);
+    }
+
+    free(*dst);
+    *dst = buf;
+    *dst_len = buf ? len : 0;
+    return 0;
+}
+
+/* Resolve a playback position to byte ranges. The DASH index is cached in the
+ * player, so only the first seek pays for downloading it. */
+static int player_setup_position(Player *p, double target)
+{
+    char err[128] = "";
+    u64 voff = 0;
+    double vtime = 0.0;
+
+    /* The prefetch may still be in flight; waiting here is cheaper than
+     * downloading the same index twice, and it makes the fields stable. */
+    index_prefetch_join(p);
+
+    if (!p->play.video_index[0])
+        return -1;
+
+    if (!p->have_vidx)
+    {
+        if (dash_load(p->play.video_url, p->play.video_init,
+                      p->play.video_index, &p->vidx, err, sizeof(err)) < 0)
+        {
+            log_printf("[player] video seek index failed: %s", err);
+            return -1;
+        }
+        p->have_vidx = 1;
+    }
+
+    if (dash_find(&p->vidx, target, &voff, &vtime) < 0)
+        return -1;
+
+    if (replace_prefix(&p->vprefix, &p->vprefix_len, p->vidx.init,
+                       p->vidx.init_len) < 0)
+        return -1;
+
+    p->vrange = (long long)voff;
+    p->video_base = vtime;
+    p->clock_base = vtime;
+
+    if (p->play.audio_url[0] && p->play.audio_index[0])
+    {
+        u64 aoff = 0;
+        double atime = 0.0;
+
+        if (!p->have_aidx)
+        {
+            if (dash_load(p->play.audio_url, p->play.audio_init,
+                          p->play.audio_index, &p->aidx, err, sizeof(err)) < 0)
+            {
+                log_printf("[player] audio seek index failed: %s", err);
+                p->play.audio_url[0] = 0;
+            }
+            else
+            {
+                p->have_aidx = 1;
+            }
+        }
+
+        if (p->have_aidx && dash_find(&p->aidx, target, &aoff, &atime) == 0)
+        {
+            if (replace_prefix(&p->aprefix, &p->aprefix_len, p->aidx.init,
+                               p->aidx.init_len) < 0)
+                return -1;
+            p->arange = (long long)aoff;
+            p->clock_base = atime;
+        }
+        else
+        {
+            p->play.audio_url[0] = 0;
+        }
+    }
+
+    log_printf("[player] seek %.1fs -> video %.1fs off=%lld audio %.1fs",
+               target, vtime, p->vrange, p->clock_base);
+    return 0;
+}
+
 Player *player_open_at(const PlayUrl *play, const VideoItem *item, double start_time)
 {
     Player *p;
@@ -950,65 +1206,35 @@ Player *player_open_at(const PlayUrl *play, const VideoItem *item, double start_
 
     if (start_time < 0.0)
         start_time = 0.0;
-    if (start_time > 0.5 && p->play.video_index[0])
+    if (start_time > 0.5)
     {
-        DashIndex vi, ai;
-        char err[128];
-        u64 voff = 0, aoff = 0;
-        double vtime = 0.0, atime = 0.0;
-        int vok;
-
-        vok = dash_load(p->play.video_url, p->play.video_init, p->play.video_index,
-                        &vi, err, sizeof(err)) == 0 &&
-              dash_find(&vi, start_time, &voff, &vtime) == 0;
-        if (vok)
+        if (player_setup_position(p, start_time) < 0)
         {
-            p->vprefix = vi.init;
-            p->vprefix_len = vi.init_len;
-            p->vrange = (long long)voff;
-            vi.init = NULL;
-            p->video_base = vtime;
-            p->clock_base = vtime;
-            dash_free(&vi);
-
-            if (p->play.audio_url[0] && p->play.audio_index[0])
-            {
-                if (dash_load(p->play.audio_url, p->play.audio_init,
-                              p->play.audio_index, &ai, err, sizeof(err)) == 0 &&
-                    dash_find(&ai, start_time, &aoff, &atime) == 0)
-                {
-                    p->aprefix = ai.init;
-                    p->aprefix_len = ai.init_len;
-                    p->arange = (long long)aoff;
-                    ai.init = NULL;
-                    p->clock_base = atime;
-                    dash_free(&ai);
-                }
-                else
-                {
-                    dash_free(&ai);
-                    log_printf("[player] audio seek index failed: %s", err);
-                    p->play.audio_url[0] = 0;
-                }
-            }
-            else
-            {
-                p->play.audio_url[0] = 0;
-            }
-
-            log_printf("[player] seek %.1fs -> video %.1fs off=%lld audio %.1fs",
-                       start_time, vtime, p->vrange, p->clock_base);
-        }
-        else
-        {
-            dash_free(&vi);
-            log_printf("[player] video seek index failed: %s; start from 0", err);
+            log_printf("[player] cannot start at %.1fs; starting from 0",
+                       start_time);
             start_time = 0.0;
+            if (p->vprefix)
+            {
+                free(p->vprefix);
+                p->vprefix = NULL;
+                p->vprefix_len = 0;
+            }
+            if (p->aprefix)
+            {
+                free(p->aprefix);
+                p->aprefix = NULL;
+                p->aprefix_len = 0;
+            }
+            p->vrange = 0;
+            p->arange = 0;
+            p->video_base = 0.0;
+            p->clock_base = 0.0;
         }
     }
 
     p->start_time = start_time;
     p->start_ms = sys_ms();
+    p->next_stat_ms = p->start_ms + 2000;
     p->osd_until = p->start_ms + 5000;
 
     rc = sys_sem_create(&p->free_sem, "p3vqf", VQ_SLOTS, VQ_SLOTS);
@@ -1067,10 +1293,93 @@ Player *player_open_at(const PlayUrl *play, const VideoItem *item, double start_
     }
     p->thread_started = 1;
 
+    /* Fetch the sidx now so the first seek does not block the UI. */
+    index_prefetch_start(p);
+
     log_printf("[player] opened %s (%dx%d) audio=%d start=%.1f",
                p->play.video_url, p->play.width, p->play.height,
                p->audio != NULL, p->start_time);
     return p;
+}
+
+int player_seek(Player *p, double target)
+{
+    double duration;
+    int rc;
+
+    if (!p)
+        return -1;
+
+    duration = p->play.duration > 0 ? p->play.duration : p->item.duration;
+    if (target < 0.0)
+        target = 0.0;
+    if (duration > 2.0 && target > duration - 2.0)
+        target = duration - 2.0;
+    if (target < 0.0)
+        target = 0.0;
+
+    /* Stop the current run but keep the VDEC session: the next run flushes it
+     * with EndSequence/StartSequence instead of reopening the decoder. */
+    p->abort = 1;
+    stream_abort(&p->vstream);
+    if (p->thread_started)
+    {
+        sysThreadJoin(p->vthread, NULL);
+        p->thread_started = 0;
+    }
+    stream_stop(&p->vstream);
+
+    /* No producer left, so the display queue can be emptied. */
+    while (sysSemTryWait(p->data_sem) == 0)
+        sysSemPost(p->free_sem, 1);
+    p->q_read = 0;
+    p->q_write = 0;
+
+    p->abort = 0;
+    p->error = 0;
+    p->error_text[0] = 0;
+    p->eof = 0;
+    p->vdec_stalled = 0;
+    p->vdec_restart = 1;
+    p->first_frame = 1;
+
+    if (player_setup_position(p, target) < 0)
+    {
+        player_set_error(p, "该视频不支持跳转");
+        return -1;
+    }
+
+    p->start_ms = sys_ms();
+    p->next_stat_ms = p->start_ms + 2000;
+
+    if (p->audio)
+    {
+        audio_player_stop(p->audio);
+        p->audio = NULL;
+    }
+    if (p->play.audio_url[0])
+    {
+        p->audio = audio_player_start_at(p->play.audio_url, p->aprefix,
+                                         p->aprefix_len, p->arange,
+                                         p->clock_base);
+        if (p->audio)
+        {
+            audio_player_set_paused(p->audio, 1);
+            p->audio_waiting = 1;
+        }
+    }
+
+    rc = sysThreadCreate(&p->vthread, video_thread, p, 1100, 0x60000, 0,
+                         "pilis3vid");
+    if (rc < 0)
+    {
+        player_set_error(p, "视频线程创建失败");
+        return -1;
+    }
+    p->thread_started = 1;
+
+    log_printf("[player] seek to %.1f s", target);
+    return 0;
 }
 
 int player_update(Player *p, const Input *in)
@@ -1102,9 +1411,7 @@ int player_update(Player *p, const Input *in)
     {
         if (p->play.video_index[0])
         {
-            p->seek_target = player_clock(p) - 10.0;
-            if (p->seek_target < 0.0)
-                p->seek_target = 0.0;
+            player_seek(p, player_clock(p) - 10.0);
             p->osd_until = sys_ms() + 5000;
             return 2;
         }
@@ -1114,10 +1421,7 @@ int player_update(Player *p, const Input *in)
     {
         if (p->play.video_index[0])
         {
-            double dur = p->play.duration > 0 ? p->play.duration : p->item.duration;
-            p->seek_target = player_clock(p) + 10.0;
-            if (dur > 2.0 && p->seek_target > dur - 2.0)
-                p->seek_target = dur - 2.0;
+            player_seek(p, player_clock(p) + 10.0);
             p->osd_until = sys_ms() + 5000;
             return 2;
         }
@@ -1138,6 +1442,15 @@ int player_update(Player *p, const Input *in)
         return 0;
 
     clock = player_clock(p);
+
+    if (sys_ms() >= p->next_stat_ms)
+    {
+        log_printf("[player] stat wall=%.1f clock=%.1f shown=%d skip=%d",
+                   (double)(sys_ms() - p->start_ms) / 1000.0,
+                   clock - p->clock_base, p->shown_total, p->vdec_skipped);
+        p->next_stat_ms = sys_ms() + 2000;
+    }
+
     if (p->audio && !audio_player_ready(p->audio) &&
         !audio_player_eof(p->audio) && !p->eof)
         return 0;
@@ -1149,6 +1462,16 @@ int player_update(Player *p, const Input *in)
         double pts = (f->pts > 0)
                          ? ((double)f->pts / 90000.0 - p->video_base)
                          : rel_clock;
+
+        /* More than 250 ms behind the clock: drop it instead of showing stale
+         * video, otherwise a slow presenter never catches up with the audio. */
+        if (!p->eof && pts < rel_clock - 0.25)
+        {
+            p->q_read = (p->q_read + 1) % VQ_SLOTS;
+            sysSemPost(p->free_sem, 1);
+            p->vdec_skipped++;
+            return 0;
+        }
 
         if (p->eof || pts <= rel_clock + 0.10)
         {
@@ -1257,10 +1580,16 @@ void player_close(Player *p)
         sysThreadJoin(p->vthread, NULL);
     stream_stop(&p->vstream);
 
+    p->idx_cancel = 1;      /* abort an in-flight sidx download */
+    index_prefetch_join(p);
+    vdec_release(p);
+
     if (p->vprefix)
         free(p->vprefix);
     if (p->aprefix)
         free(p->aprefix);
+    dash_free(&p->vidx);
+    dash_free(&p->aidx);
 
     for (int i = 0; i < VQ_SLOTS; ++i)
         if (p->buffers[i])
@@ -1290,11 +1619,6 @@ int player_ready(Player *p)
 double player_current_time(Player *p)
 {
     return p ? player_clock(p) : 0.0;
-}
-
-double player_seek_target(Player *p)
-{
-    return p ? p->seek_target : 0.0;
 }
 
 int player_quality_delta(Player *p)

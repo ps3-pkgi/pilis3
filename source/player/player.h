@@ -10,8 +10,9 @@ Player *player_open(const PlayUrl *play, const VideoItem *item);
 Player *player_open_at(const PlayUrl *play, const VideoItem *item, double start_time);
 /* update returns: 0 normal, 1 exit, 2 seek request, 3 quality request */
 int player_update(Player *p, const Input *in);
+/* Jump to target seconds in place: the VDEC session is flushed, not reopened. */
+int player_seek(Player *p, double target);
 double player_current_time(Player *p);
-double player_seek_target(Player *p);
 int player_quality_delta(Player *p);
 int player_quality_qn(Player *p);
 void player_show_hint(Player *p, const char *text);

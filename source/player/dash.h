@@ -19,6 +19,10 @@ typedef struct
 
 int dash_load(const char *url, const char *init_range, const char *index_range,
               DashIndex *idx, char *err, int err_size);
+/* Aborts both range requests once *cancel becomes non-zero. */
+int dash_load_ex(const char *url, const char *init_range, const char *index_range,
+                 DashIndex *idx, char *err, int err_size,
+                 const volatile int *cancel);
 int dash_find(const DashIndex *idx, double target, u64 *offset, double *seg_time);
 void dash_free(DashIndex *idx);
 
