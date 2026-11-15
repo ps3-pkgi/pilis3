@@ -58,13 +58,24 @@ jobs:
             -e PATH=/usr/local/ps3dev/ppu/bin:/usr/local/ps3dev/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             ${{ env.IMAGE }} \
             sh -c 'make -j"$(nproc)"'
+          docker run --rm \
+            --platform linux/amd64 \
+            -v "$GITHUB_WORKSPACE:/ws" \
+            -w /ws \
+            -e PSL1GHT=/usr/local/ps3dev \
+            -e PS3DEV=/usr/local/ps3dev \
+            -e PORTLIBS=/usr/local/ps3dev/portlibs/ppu \
+            -e FFMPEG_PS3=/opt/ffmpeg-ps3 \
+            -e PATH=/usr/local/ps3dev/ppu/bin:/usr/local/ps3dev/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            ${{ env.IMAGE }} \
+            sh -c 'cd probe && make -j"$(nproc)"'
           # 容器内以 root 构建，产物属于 root；改回 runner 用户，便于后续读取和清理。
-          sudo chown -R "$(id -u):$(id -g)" out build
+          sudo chown -R "$(id -u):$(id -g)" out build probe/out probe/build
 
       - name: Collect packages
         run: |
           mkdir -p dist
-          cp out/*.pkg dist/
+          cp out/*.pkg probe/out/*.pkg dist/
           test -s dist/pilis3.pkg
           ls -lh dist
 
